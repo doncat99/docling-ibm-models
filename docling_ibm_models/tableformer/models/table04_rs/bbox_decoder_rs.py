@@ -148,17 +148,26 @@ class BBoxDecoder(nn.Module):
         predictions_bboxes = []
         predictions_classes = []
 
-        for c_id in range(num_cells):
-            # Start decoding
+        if num_cells:
             h = self._init_hidden_state(encoder_out, 1)
-            cell_tag_H = tag_H[c_id]
-            awe, _ = self._attention(encoder_out, cell_tag_H, h)
+            attention = self._attention
+            image_features = attention._encoder_att(encoder_out)
+            language_features = attention._language_att(h).unsqueeze(1)
             gate = self._sigmoid(self._f_beta(h))
-            awe = gate * awe
-            h = awe * h
-
-            predictions_bboxes.append(self._bbox_embed(h).sigmoid())
-            predictions_classes.append(self._class_embed(h))
+            # Bound temporary attention tensors independently of table size.
+            for cell_tag_H in torch.cat(tag_H, dim=0).split(32):
+                scores = attention._full_att(
+                    attention._relu(
+                        image_features
+                        + attention._tag_decoder_att(cell_tag_H).unsqueeze(1)
+                        + language_features
+                    )
+                ).squeeze(2)
+                alpha = attention._softmax(scores)
+                awe = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)
+                hidden = gate * awe * h
+                predictions_bboxes.extend(self._bbox_embed(hidden).sigmoid().split(1))
+                predictions_classes.extend(self._class_embed(hidden).split(1))
         if len(predictions_bboxes) > 0:
             predictions_bboxes = torch.stack([x[0] for x in predictions_bboxes])
         else:

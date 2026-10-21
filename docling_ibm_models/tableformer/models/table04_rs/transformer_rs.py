@@ -1,14 +1,33 @@
 import logging
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 import docling_ibm_models.tableformer.utils.utils as u
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
+
+
+@dataclass
+class AttentionCache:
+    memory_key: Tensor
+    memory_value: Tensor
+    key: Tensor
+    value: Tensor
+
+
+def attention_heads(x: Tensor, num_heads: int) -> Tensor:
+    length, batch, width = x.shape
+    return (
+        x.permute(1, 0, 2)
+        .reshape(batch, length, num_heads, width // num_heads)
+        .transpose(1, 2)
+    )
 
 
 class PositionalEncoding(nn.Module):
@@ -26,12 +45,87 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0).transpose(0, 1)
         self.register_buffer("pe", pe)
 
-    def forward(self, x):
-        x = x + self.pe[: x.size(0), :]
+    def forward(self, x, offset=0):
+        length = offset + x.size(0)
+        if length > self.pe.size(0):
+            # Preserve checkpoint positions exactly; compute only the missing tail.
+            d_model = self.pe.size(-1)
+            capacity = max(length, self.pe.size(0) * 2)
+            position = torch.arange(
+                self.pe.size(0), capacity, dtype=torch.float
+            ).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+            )
+            tail = torch.empty(capacity - self.pe.size(0), 1, d_model)
+            tail[:, 0, 0::2] = torch.sin(position * div_term)
+            tail[:, 0, 1::2] = torch.cos(position * div_term)
+            self.pe = torch.cat((self.pe, tail.to(self.pe)), dim=0)
+        x = x + self.pe[offset:length, :]
         return self.dropout(x)
 
 
 class TMTransformerDecoder(nn.TransformerDecoder):
+    def prepare_cache(self, memory: Tensor, capacity: int) -> list[AttentionCache]:
+        states = []
+        for layer in self.layers:
+            attn = layer.multihead_attn
+            width = attn.embed_dim
+            key, value = F.linear(
+                memory, attn.in_proj_weight[width:], attn.in_proj_bias[width:]
+            ).chunk(2, dim=-1)
+            shape = (memory.size(1), attn.num_heads, capacity, width // attn.num_heads)
+            states.append(
+                AttentionCache(
+                    attention_heads(key, attn.num_heads),
+                    attention_heads(value, attn.num_heads),
+                    memory.new_empty(shape),
+                    memory.new_empty(shape),
+                )
+            )
+        return states
+
+    def forward_step(
+        self, x: Tensor, position: int, states: list[AttentionCache]
+    ) -> Tensor:
+        """Decode one token; each key and value is projected once per table."""
+        for layer, state in zip(self.layers, states):
+            attn = layer.self_attn
+            query, key, value = F.linear(
+                x, attn.in_proj_weight, attn.in_proj_bias
+            ).chunk(3, dim=-1)
+            state.key[:, :, position : position + 1] = attention_heads(
+                key, attn.num_heads
+            )
+            state.value[:, :, position : position + 1] = attention_heads(
+                value, attn.num_heads
+            )
+            out = F.scaled_dot_product_attention(
+                attention_heads(query, attn.num_heads),
+                state.key[:, :, : position + 1],
+                state.value[:, :, : position + 1],
+            )
+            out = (
+                out.transpose(1, 2)
+                .reshape(x.size(1), 1, attn.embed_dim)
+                .transpose(0, 1)
+            )
+            x = layer.norm1(x + F.linear(out, attn.out_proj.weight, attn.out_proj.bias))
+            attn = layer.multihead_attn
+            width = attn.embed_dim
+            query = F.linear(x, attn.in_proj_weight[:width], attn.in_proj_bias[:width])
+            out = F.scaled_dot_product_attention(
+                attention_heads(query, attn.num_heads),
+                state.memory_key,
+                state.memory_value,
+            )
+            out = out.transpose(1, 2).reshape(x.size(1), 1, width).transpose(0, 1)
+            x = layer.norm2(x + F.linear(out, attn.out_proj.weight, attn.out_proj.bias))
+            x = layer.norm3(x + layer.linear2(layer.activation(layer.linear1(x))))
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
     def forward(  # type: ignore
         self,
         tgt: Tensor,
@@ -138,7 +232,6 @@ class Tag_Transformer(nn.Module):
         n_heads=4,
         dim_ff=1024,
     ):
-
         super(Tag_Transformer, self).__init__()
 
         self._device = device

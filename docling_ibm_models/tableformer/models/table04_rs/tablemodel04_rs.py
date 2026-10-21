@@ -17,6 +17,17 @@ LOG_LEVEL = logging.WARN
 # LOG_LEVEL = logging.DEBUG
 
 
+class TableDecodingLimitError(RuntimeError):
+    """A bounded decode must never publish a table without its end token."""
+
+    def __init__(self, max_steps, generated_steps):
+        self.max_steps = max_steps
+        self.generated_steps = generated_steps
+        super().__init__(
+            f"Table decoding exhausted {max_steps} steps without an end token"
+        )
+
+
 class TableModel04_rs(BaseModel, nn.Module):
     r"""
     TableNet04Model encoder, dual-decoder model with OTSL+ support
@@ -62,8 +73,6 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._num_classes = config["model"]["bbox_classes"]
         self._enc_image_size = config["model"]["enc_image_size"]
 
-        self._max_pred_len = config["predict"]["max_steps"]
-
         self._tag_transformer = Tag_Transformer(
             device,
             tag_vocab_size,
@@ -99,12 +108,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         new_h = (bbox2[1] + bbox2[3] / 2) - (bbox1[1] - bbox1[3] / 2)
 
         new_left = bbox1[0] - bbox1[2] / 2
-        new_top = min((bbox2[1] - bbox2[3] / 2), (bbox1[1] - bbox1[3] / 2))
+        new_top = torch.minimum(bbox2[1] - bbox2[3] / 2, bbox1[1] - bbox1[3] / 2)
 
         new_cx = new_left + new_w / 2
         new_cy = new_top + new_h / 2
 
-        bboxm = torch.tensor([new_cx, new_cy, new_w, new_h])
+        bboxm = torch.stack([new_cx, new_cy, new_w, new_h])
         return bboxm
 
     def predict(self, imgs, max_steps, k, return_attention=False):
@@ -127,6 +136,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         outputs_coord : tensor(x, 4)
             Coords of predicted bboxes. x is the number of bboxes. Each bbox is in [cxcywh] format
         """
+        if (
+            not isinstance(max_steps, int)
+            or isinstance(max_steps, bool)
+            or max_steps < 1
+        ):
+            raise ValueError("max_steps must be a positive integer")
         AggProfiler().begin("predict_total", self._prof)
 
         # Invoke encoder
@@ -158,11 +173,9 @@ class TableModel04_rs(BaseModel, nn.Module):
         encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
         AggProfiler().end("model_tag_transformer_encoder", self._prof)
 
-        decoded_tags = (
-            torch.LongTensor([word_map["<start>"]]).to(self._device).unsqueeze(1)
-        )
+        decoded_tags = [word_map["<start>"]]
         output_tags = []
-        cache = None
+        cache = self._tag_transformer._decoder.prepare_cache(encoder_out, max_steps)
         tag_H_buf = []
 
         skip_next_tag = True
@@ -176,17 +189,18 @@ class TableModel04_rs(BaseModel, nn.Module):
         bbox_ind = 0
 
         # i = 0
-        while len(output_tags) < self._max_pred_len:
-            decoded_embedding = self._tag_transformer._embedding(decoded_tags)
+        while len(output_tags) < max_steps:
+            position = len(output_tags)
+            token = torch.tensor([[decoded_tags[-1]]], device=self._device)
+            decoded_embedding = self._tag_transformer._embedding(token)
             decoded_embedding = self._tag_transformer._positional_encoding(
-                decoded_embedding
+                decoded_embedding, offset=position
             )
             AggProfiler().begin("model_tag_transformer_decoder", self._prof)
-            decoded, cache = self._tag_transformer._decoder(
+            decoded = self._tag_transformer._decoder.forward_step(
                 decoded_embedding,
-                encoder_out,
+                position,
                 cache,
-                memory_key_padding_mask=encoder_mask,
             )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
@@ -209,13 +223,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             # End of generation
             if new_tag == word_map["<end>"]:
                 output_tags.append(new_tag)
-                decoded_tags = torch.cat(
-                    [
-                        decoded_tags,
-                        torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
-                    ],
-                    dim=0,
-                )  # current_output_len, 1
+                decoded_tags.append(new_tag)
                 break
             output_tags.append(new_tag)
 
@@ -263,14 +271,10 @@ class TableModel04_rs(BaseModel, nn.Module):
             else:
                 prev_tag_ucel = False
 
-            decoded_tags = torch.cat(
-                [
-                    decoded_tags,
-                    torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
-                ],
-                dim=0,
-            )  # current_output_len, 1
-        seq = decoded_tags.squeeze().tolist()
+            decoded_tags.append(new_tag)
+        else:
+            raise TableDecodingLimitError(max_steps, len(output_tags))
+        seq = decoded_tags
 
         if self._bbox:
             AggProfiler().begin("model_bbox_decoder", self._prof)
