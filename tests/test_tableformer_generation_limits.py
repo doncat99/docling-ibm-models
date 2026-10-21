@@ -5,6 +5,7 @@ from torch import nn
 from docling_ibm_models.tableformer.models.table04_rs.bbox_decoder_rs import BBoxDecoder
 from docling_ibm_models.tableformer.models.table04_rs.tablemodel04_rs import (
     TableModel04_rs,
+    _TagDraft,
 )
 from docling_ibm_models.tableformer.models.table04_rs.transformer_rs import (
     PositionalEncoding,
@@ -113,6 +114,90 @@ def test_incremental_positions_match_full_prefix():
             rtol=0,
             atol=0,
         )
+
+
+@torch.no_grad()
+def test_verified_block_matches_each_serial_greedy_step():
+    torch.manual_seed(19)
+    transformer = Tag_Transformer("cpu", 13, [], 512, 1, 2, 2).eval()
+    memory = torch.randn(4, 1, 512)
+    tokens = torch.randn(8, 1, 512)
+    states = transformer._decoder.prepare_cache(memory, len(tokens))
+    expected = []
+    for position in range(len(tokens)):
+        expected.append(
+            transformer._decoder.forward_step(
+                tokens[position : position + 1], position, states
+            )
+        )
+    blocked = transformer._decoder.prepare_cache(memory, len(tokens))
+    actual = transformer._decoder.forward_block(tokens, 0, blocked)
+    torch.testing.assert_close(actual, torch.cat(expected), rtol=1e-5, atol=1e-6)
+
+
+def test_tableformer_drafts_the_longest_repeated_tag_suffix():
+    draft = _TagDraft(1, 5)
+    for tag in [2, 3, 4, 2, 3, 4]:
+        draft.append(tag)
+    assert draft.propose(3) == [2, 3, 4]
+
+
+def full_history_draft(history, count):
+    """Original full-history matcher, kept only as an independent test oracle."""
+    proposed = []
+    working = history.copy()
+    for _ in range(count):
+        found = None
+        for width in range(min(16, len(working)), 0, -1):
+            suffix = working[-width:]
+            for index in range(len(history) - width - 1, -1, -1):
+                if history[index : index + width] == suffix:
+                    found = history[index + width]
+                    break
+            if found is not None:
+                break
+        proposed.append(5 if found is None else found)
+        working.append(proposed[-1])
+    return proposed
+
+
+def test_incremental_draft_index_matches_full_history_after_every_accept():
+    history = [2]
+    draft = _TagDraft(2, 5)
+    generator = torch.Generator().manual_seed(19)
+    # Repeated rows plus irregular spans exercise longest-suffix replacement.
+    stream = [5, 5, 9] * 20 + torch.randint(4, 13, (80,), generator=generator).tolist()
+    for tag in stream:
+        history.append(tag)
+        draft.append(tag)
+        assert draft.propose(15) == full_history_draft(history, 15)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("seed", [7, 19, 31])
+def test_rejected_proposals_preserve_greedy_tags_and_hidden_states(seed):
+    torch.manual_seed(seed)
+    model = model_with_eos(None)
+    model._tag_transformer._fc = nn.Linear(512, 13)
+    memory = torch.randn(4, 1, 512)
+    vocab = model._init_data["word_map"]["word_map_tag"]
+    serial = list(model._verified_tag_steps(memory, 48, vocab, block_size=1))
+    speculative = list(model._verified_tag_steps(memory, 48, vocab, block_size=16))
+    assert [tag for _, tag in speculative] == [tag for _, tag in serial]
+    torch.testing.assert_close(
+        torch.cat([state for state, _ in speculative]),
+        torch.cat([state for state, _ in serial]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_speculative_tag_correction_matches_tableformer_state_rules():
+    word_map = {"xcel": 8, "lcel": 6, "ucel": 7, "fcel": 5}
+    correct = TableModel04_rs._correct_tag
+    assert correct(8, 0, 0, word_map) == 6
+    assert correct(8, 0, 1, word_map) == 8
+    assert correct(6, 7, 0, word_map) == 5
 
 
 @torch.no_grad()

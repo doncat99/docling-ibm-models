@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterator
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,34 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 LOG_LEVEL = logging.WARN
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
+
+
+class _TagDraft:
+    """Index accepted tags once; rejected proposals never enter the index."""
+
+    def __init__(self, start, default_tag, max_context=16):
+        self.history = [start]
+        self.default_tag = default_tag
+        self.patterns = [{} for _ in range(max_context + 1)]
+
+    def append(self, tag):
+        for width in range(1, min(len(self.patterns) - 1, len(self.history)) + 1):
+            self.patterns[width][tuple(self.history[-width:])] = tag
+        self.history.append(tag)
+
+    def propose(self, count):
+        working = self.history[-(len(self.patterns) - 1) :]
+        proposed = []
+        for _ in range(count):
+            tag = self.default_tag
+            for width in range(min(len(self.patterns) - 1, len(working)), 0, -1):
+                candidate = self.patterns[width].get(tuple(working[-width:]))
+                if candidate is not None:
+                    tag = candidate
+                    break
+            proposed.append(tag)
+            working.append(tag)
+        return proposed
 
 
 class TableDecodingLimitError(RuntimeError):
@@ -116,6 +145,46 @@ class TableModel04_rs(BaseModel, nn.Module):
         bboxm = torch.stack([new_cx, new_cy, new_w, new_h])
         return bboxm
 
+    @staticmethod
+    def _correct_tag(tag, previous_tag, line_num, word_map):
+        if line_num == 0 and tag == word_map["xcel"]:
+            tag = word_map["lcel"]
+        if previous_tag == word_map["ucel"] and tag == word_map["lcel"]:
+            tag = word_map["fcel"]
+        return tag
+
+    def _verified_tag_steps(
+        self, encoder_out, max_steps, word_map, line_num=0, block_size=16
+    ) -> Iterator[tuple[torch.Tensor, int]]:
+        transformer = self._tag_transformer
+        states = transformer._decoder.prepare_cache(encoder_out, max_steps)
+        draft = _TagDraft(word_map["<start>"], word_map["fcel"])
+        history = draft.history
+        while len(history) - 1 < max_steps:
+            position = len(history) - 1
+            width = min(block_size, max_steps - position)
+            proposals = draft.propose(width - 1)
+            inputs = torch.tensor(
+                [[history[-1], *proposals]], device=self._device
+            ).transpose(0, 1)
+            embeddings = transformer._positional_encoding(
+                transformer._embedding(inputs), offset=position
+            )
+            decoded = (
+                transformer._decoder.forward_step(embeddings, position, states)
+                if width == 1
+                else transformer._decoder.forward_block(embeddings, position, states)
+            )
+            predicted = transformer._fc(decoded[:, 0]).argmax(-1).cpu().tolist()
+            for index, raw_tag in enumerate(predicted):
+                tag = self._correct_tag(raw_tag, history[-1], line_num, word_map)
+                draft.append(tag)
+                yield decoded[index : index + 1], raw_tag
+                if tag == word_map["<end>"]:
+                    return
+                if index < len(proposals) and tag != proposals[index]:
+                    break
+
     def predict(self, imgs, max_steps, k, return_attention=False):
         r"""
         Inference.
@@ -175,7 +244,7 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         decoded_tags = [word_map["<start>"]]
         output_tags = []
-        cache = self._tag_transformer._decoder.prepare_cache(encoder_out, max_steps)
+        verified = self._verified_tag_steps(encoder_out, max_steps, word_map)
         tag_H_buf = []
 
         skip_next_tag = True
@@ -190,35 +259,18 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # i = 0
         while len(output_tags) < max_steps:
-            position = len(output_tags)
-            token = torch.tensor([[decoded_tags[-1]]], device=self._device)
-            decoded_embedding = self._tag_transformer._embedding(token)
-            decoded_embedding = self._tag_transformer._positional_encoding(
-                decoded_embedding, offset=position
-            )
             AggProfiler().begin("model_tag_transformer_decoder", self._prof)
-            decoded = self._tag_transformer._decoder.forward_step(
-                decoded_embedding,
-                position,
-                cache,
-            )
+            decoded, new_tag = next(verified)
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
-            # Grab last feature to produce token
-            AggProfiler().begin("model_tag_transformer_fc", self._prof)
-            logits = self._tag_transformer._fc(decoded[-1, :, :])  # 1, vocab_size
-            AggProfiler().end("model_tag_transformer_fc", self._prof)
-            new_tag = logits.argmax(1).item()
 
             # STRUCTURE ERROR CORRECTION
             # Correction for first line xcel...
-            if line_num == 0:
-                if new_tag == word_map["xcel"]:
-                    new_tag = word_map["lcel"]
-
-            # Correction for ucel, lcel sequence...
-            if prev_tag_ucel:
-                if new_tag == word_map["lcel"]:
-                    new_tag = word_map["fcel"]
+            new_tag = self._correct_tag(
+                new_tag,
+                word_map["ucel"] if prev_tag_ucel else decoded_tags[-1],
+                line_num,
+                word_map,
+            )
 
             # End of generation
             if new_tag == word_map["<end>"]:
@@ -226,6 +278,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                 decoded_tags.append(new_tag)
                 break
             output_tags.append(new_tag)
+            decoded_tags.append(new_tag)
 
             # BBOX PREDICTION
 
@@ -271,7 +324,6 @@ class TableModel04_rs(BaseModel, nn.Module):
             else:
                 prev_tag_ucel = False
 
-            decoded_tags.append(new_tag)
         else:
             raise TableDecodingLimitError(max_steps, len(output_tags))
         seq = decoded_tags

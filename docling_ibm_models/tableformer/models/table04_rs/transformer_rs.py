@@ -126,6 +126,52 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             x = self.norm(x)
         return x
 
+    def forward_block(
+        self, x: Tensor, position: int, states: list[AttentionCache]
+    ) -> Tensor:
+        """Verify several proposed tokens with one causal decoder call."""
+        length = x.size(0)
+        key_length = position + length
+        mask = (
+            torch.arange(key_length, device=x.device)[None, :]
+            <= torch.arange(position, key_length, device=x.device)[:, None]
+        )
+        for layer, state in zip(self.layers, states):
+            attn = layer.self_attn
+            query, key, value = F.linear(
+                x, attn.in_proj_weight, attn.in_proj_bias
+            ).chunk(3, dim=-1)
+            state.key[:, :, position:key_length] = attention_heads(key, attn.num_heads)
+            state.value[:, :, position:key_length] = attention_heads(
+                value, attn.num_heads
+            )
+            out = F.scaled_dot_product_attention(
+                attention_heads(query, attn.num_heads),
+                state.key[:, :, :key_length],
+                state.value[:, :, :key_length],
+                attn_mask=mask,
+            )
+            out = (
+                out.transpose(1, 2)
+                .reshape(x.size(1), length, attn.embed_dim)
+                .transpose(0, 1)
+            )
+            x = layer.norm1(x + layer.self_attn.out_proj(out))
+            attn = layer.multihead_attn
+            width = attn.embed_dim
+            query = F.linear(x, attn.in_proj_weight[:width], attn.in_proj_bias[:width])
+            out = F.scaled_dot_product_attention(
+                attention_heads(query, attn.num_heads),
+                state.memory_key,
+                state.memory_value,
+            )
+            out = out.transpose(1, 2).reshape(x.size(1), length, width).transpose(0, 1)
+            x = layer.norm2(x + layer.multihead_attn.out_proj(out))
+            x = layer.norm3(x + layer.linear2(layer.activation(layer.linear1(x))))
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
     def forward(  # type: ignore
         self,
         tgt: Tensor,
