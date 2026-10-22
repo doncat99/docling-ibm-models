@@ -135,6 +135,41 @@ def test_verified_block_matches_each_serial_greedy_step():
     torch.testing.assert_close(actual, torch.cat(expected), rtol=1e-5, atol=1e-6)
 
 
+@torch.no_grad()
+def test_verified_block_reuses_one_additive_causal_mask(monkeypatch):
+    torch.manual_seed(29)
+    transformer = Tag_Transformer("cpu", 13, [], 512, 1, 2, 2).eval()
+    decoder = transformer._decoder
+    memory = torch.randn(4, 1, 512)
+    tokens = torch.randn(8, 1, 512)
+    serial = decoder.prepare_cache(memory, len(tokens))
+    expected = torch.cat(
+        [decoder.forward_step(tokens[i : i + 1], i, serial) for i in range(8)]
+    )
+    states = decoder.prepare_cache(memory, len(tokens))
+    for position in range(3):
+        decoder.forward_step(tokens[position : position + 1], position, states)
+    masks = []
+    attention = torch.nn.functional.scaled_dot_product_attention
+
+    def capture_mask(*args, **kwargs):
+        if kwargs.get("attn_mask") is not None:
+            masks.append(kwargs["attn_mask"])
+        return attention(*args, **kwargs)
+
+    monkeypatch.setattr(
+        torch.nn.functional, "scaled_dot_product_attention", capture_mask
+    )
+    actual = decoder.forward_block(tokens[3:], 3, states)
+    torch.testing.assert_close(actual, expected[3:], rtol=1e-5, atol=1e-6)
+    assert len(masks) == len(decoder.layers)
+    assert all(mask is masks[0] for mask in masks)
+    assert masks[0].dtype == tokens.dtype
+    for row in range(5):
+        assert torch.all(masks[0][row, : row + 4] == 0)
+        assert torch.all(masks[0][row, row + 4 :] == -torch.inf)
+
+
 def test_tableformer_drafts_the_longest_repeated_tag_suffix():
     draft = _TagDraft(1, 5, row_end=9)
     for tag in [2, 3, 4, 2, 3, 4]:

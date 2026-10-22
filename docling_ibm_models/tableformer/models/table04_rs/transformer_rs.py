@@ -136,6 +136,8 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             torch.arange(key_length, device=x.device)[None, :]
             <= torch.arange(position, key_length, device=x.device)[:, None]
         )
+        # SDPA otherwise repeats the same boolean-to-additive conversion per layer.
+        mask = torch.where(mask, 0.0, float("-inf")).to(dtype=x.dtype)
         for layer, state in zip(self.layers, states):
             attn = layer.self_attn
             query, key, value = F.linear(

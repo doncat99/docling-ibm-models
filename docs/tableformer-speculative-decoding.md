@@ -5,6 +5,44 @@ OntoScience release or a general speed guarantee.
 
 ## Algorithm and remaining limits
 
+### Shared additive causal mask
+
+The block decoder previously supplied the same boolean causal mask to each
+of its six attention layers. PyTorch SDPA converted that mask to additive
+zero/negative-infinity form once per layer. The decoder now constructs the
+additive mask once per verified block and reuses it across layers. The dtype
+matches the decoder input. Prefix offsets and causal visibility are unchanged.
+This removes repeated mask conversion without changing verification width,
+proposal generation, weights, precision, concurrency, or table batching.
+
+Two alternating fresh-process full-report pairs, using the configuration and
+77-page input identified below, measured conversion wall time including model
+initialization:
+
+| Pair | Boolean mask | Shared additive mask |
+| --- | ---: | ---: |
+| 1 | 30.434 s | 28.621 s |
+| 2, candidate first | 31.760 s | 28.807 s |
+| Median | 31.097 s | 28.714 s |
+
+The observed median reduction is 7.7%. All four complete exported documents,
+including coordinates, were exactly equal: 77 pages, 37 tables, 5877 cells,
+zero conversion errors. This is one machine and one report, not a general
+speed guarantee. An isolated four-round replay preserved all accepted hidden
+states and tags bitwise; one replay round was slower with the candidate.
+CPU profiler spans that include tensor materialization also include device
+completion waits and must not be reported as pure transfer overhead.
+
+The regression specification failed before the source change because SDPA
+received a boolean mask. It checks serial-versus-block hidden states with a
+nonempty cached prefix, exact causal visibility, dtype, and reuse across layers.
+Local evidence: `decoder-mask-full-{baseline,candidate}-{1,2}/`,
+`decoder-mask-replay-oct22.json`, and `decoder-operators-oct22-trace.json` in
+OntoScience's ignored `.tmp` directory. This source change does not update the
+installed application or establish the 7–14 second full-report goal.
+
+### Draft algorithm
+
 The decoder proposes up to 31 tags on MPS (15 on other backends). It first
 searches accepted suffixes at the same tag offset within a row, then searches
 suffixes without a position constraint if that position has no match. One
