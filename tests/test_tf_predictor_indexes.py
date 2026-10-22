@@ -1,6 +1,82 @@
+from contextlib import contextmanager
+from unittest.mock import Mock
+
+import numpy as np
 import pytest
+import torch
 
 from docling_ibm_models.tableformer.data_management.tf_predictor import TFPredictor
+
+
+@pytest.mark.parametrize("method", ["predict", "predict_dummy"])
+def test_inference_guard_excludes_cpu_preparation_and_matching(monkeypatch, method):
+    active = False
+    calls = []
+
+    @contextmanager
+    def guard():
+        nonlocal active
+        assert not active
+        active = True
+        calls.append("enter")
+        try:
+            yield
+        finally:
+            active = False
+
+    def prepare(image):
+        assert not active
+        calls.append("prepare")
+        return torch.zeros(1, 3, 4, 4)
+
+    transfer = torch.Tensor.to
+    tolist = torch.Tensor.tolist
+
+    def guarded_transfer(tensor, *args, **kwargs):
+        assert active
+        return transfer(tensor, *args, **kwargs)
+
+    def guarded_materialize(tensor):
+        assert active
+        return tolist(tensor)
+
+    def infer(*args):
+        assert active
+        calls.append("infer")
+        return [2, 5, 9, 3], torch.zeros(1, 2), torch.ones(1, 4)
+
+    def boxes(tensor):
+        assert active
+        calls.append("boxes")
+        return tensor
+
+    def match(*args):
+        assert not active
+        calls.append("match")
+        return {"table_cells": [], "matches": {}, "pdf_cells": []}
+
+    predictor = TFPredictor.__new__(TFPredictor)
+    predictor._config = {"predict": {"max_steps": 32, "beam_size": 1, "bbox": True}}
+    predictor._prof = False
+    predictor._device = "cpu"
+    predictor._inference_context = guard
+    predictor._remove_padding = False
+    predictor._model = Mock(predict=infer)
+    predictor._prepare_image = prepare
+    predictor._get_html_tags = lambda tags: ["fcel", "nl"]
+    predictor._check_bbox_sync = lambda prediction: (True, [])
+    predictor._cell_matcher = Mock(match_cells=match, match_cells_dummy=match)
+    predictor._generate_tf_response = lambda *args: []
+    predictor._generate_tf_response_dummy = lambda *args: []
+    predictor._merge_tf_output = lambda *args: []
+    monkeypatch.setattr(
+        "docling_ibm_models.tableformer.data_management.tf_predictor.u.box_cxcywh_to_xyxy",
+        boxes,
+    )
+    monkeypatch.setattr(torch.Tensor, "to", guarded_transfer)
+    monkeypatch.setattr(torch.Tensor, "tolist", guarded_materialize)
+    getattr(predictor, method)({"tokens": []}, [0, 0, 10, 10], np.zeros((4, 4, 3)), 1)
+    assert calls == ["prepare", "enter", "infer", "boxes", "match"]
 
 
 def _cell(start_col, start_row, col_span=1, row_span=1):

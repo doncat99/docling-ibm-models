@@ -4,6 +4,8 @@ import logging
 import os
 import threading
 from bisect import bisect_left
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from itertools import groupby
 from pathlib import Path
 
@@ -91,13 +93,21 @@ class TFPredictor:
     Table predictions for the in-memory Docling API
     """
 
-    def __init__(self, config, device: str = "cpu", num_threads: int = 4):
+    def __init__(
+        self,
+        config,
+        device: str = "cpu",
+        num_threads: int = 4,
+        *,
+        inference_context: Callable[[], AbstractContextManager] = nullcontext,
+    ):
         r"""
         Parameters
         ----------
         config : dict Parameters configuration
         device: (Optional) torch device to run the inference.
         num_threads: (Optional) Number of threads to run the inference if device = 'cpu'
+        inference_context: Guard shared device submissions, excluding CPU processing.
 
         Raises
         ------
@@ -106,6 +116,7 @@ class TFPredictor:
         """
         # self._device = torch.device(device)
         self._device = device
+        self._inference_context = inference_context
         self._log().info("Running on device: {}".format(device))
 
         self._config = config
@@ -125,8 +136,9 @@ class TFPredictor:
             torch.set_num_threads(self._num_threads)
 
         # Load the model
-        self._model = self._load_model()
-        self._model.eval()
+        with self._inference_context():
+            self._model = self._load_model()
+            self._model.eval()
         self._prof = config["predict"].get("profiling", False)
         self._profiling_agg_window = config["predict"].get("profiling_agg_window", None)
         if self._profiling_agg_window is not None:
@@ -588,36 +600,16 @@ class TFPredictor:
         # Return grouped results of predictions
         return multi_tf_output
 
-    def predict_dummy(
-        self, iocr_page, table_bbox, table_image, scale_factor, eval_res_preds=None
-    ):
-        r"""
-        Predict the table out of an image in memory
-
-        Parameters
-        ----------
-        iocr_page : dict
-            Docling provided table data
-        eval_res_preds : dict
-            Ready predictions provided by the evaluation results
-
-        Returns
-        -------
-        docling_output : string
-            json response formatted according to Docling api expectations
-
-        matching_details : string
-            json with details about the matching between the pdf cells and the table cells
-        """
-        AggProfiler().start_agg(self._prof)
-
+    def _predict_image(self, table_image, eval_res_preds):
+        """Materialize device outputs before releasing the submission guard."""
+        image_batch = self._prepare_image(table_image)
         max_steps = self._config["predict"]["max_steps"]
         beam_size = self._config["predict"]["beam_size"]
-        image_batch = self._prepare_image(table_image)
         # Make predictions
         prediction = {}
 
-        with torch.no_grad():
+        with self._inference_context(), torch.no_grad():
+            image_batch = image_batch.to(device=self._device)
             # Compute predictions
             if (
                 eval_res_preds is not None
@@ -656,9 +648,35 @@ class TFPredictor:
                 if self._remove_padding:
                     pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
 
-            prediction["tag_seq"] = pred_tag_seq
-            prediction["rs_seq"] = self._get_html_tags(pred_tag_seq)
-            prediction["html_seq"] = otsl_to_html(prediction["rs_seq"], False)
+        prediction["tag_seq"] = pred_tag_seq
+        prediction["rs_seq"] = self._get_html_tags(pred_tag_seq)
+        prediction["html_seq"] = otsl_to_html(prediction["rs_seq"], False)
+        return prediction
+
+    def predict_dummy(
+        self, iocr_page, table_bbox, table_image, scale_factor, eval_res_preds=None
+    ):
+        r"""
+        Predict the table out of an image in memory
+
+        Parameters
+        ----------
+        iocr_page : dict
+            Docling provided table data
+        eval_res_preds : dict
+            Ready predictions provided by the evaluation results
+
+        Returns
+        -------
+        docling_output : string
+            json response formatted according to Docling api expectations
+
+        matching_details : string
+            json with details about the matching between the pdf cells and the table cells
+        """
+        AggProfiler().start_agg(self._prof)
+
+        prediction = self._predict_image(table_image, eval_res_preds)
         # Remove implied padding from bbox predictions,
         # that we added on image pre-processing stage
         self._log().debug("----- rs_seq -----")
@@ -742,54 +760,7 @@ class TFPredictor:
         """
         AggProfiler().start_agg(self._prof)
 
-        max_steps = self._config["predict"]["max_steps"]
-        beam_size = self._config["predict"]["beam_size"]
-        image_batch = self._prepare_image(table_image)
-        # Make predictions
-        prediction = {}
-
-        with torch.no_grad():
-            # Compute predictions
-            if (
-                eval_res_preds is not None
-            ):  # Don't run the model, use the provided predictions
-                prediction["bboxes"] = eval_res_preds["bboxes"]
-                pred_tag_seq = eval_res_preds["tag_seq"]
-            elif self._config["predict"]["bbox"]:
-                pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
-                    image_batch, max_steps, beam_size
-                )
-
-                if outputs_coord is not None:
-                    if len(outputs_coord) == 0:
-                        prediction["bboxes"] = []
-                    else:
-                        bbox_pred = u.box_cxcywh_to_xyxy(outputs_coord)
-                        prediction["bboxes"] = bbox_pred.tolist()
-                else:
-                    prediction["bboxes"] = []
-
-                if outputs_class is not None:
-                    if len(outputs_class) == 0:
-                        prediction["classes"] = []
-                    else:
-                        result_class = torch.argmax(outputs_class, dim=1)
-                        prediction["classes"] = result_class.tolist()
-                else:
-                    prediction["classes"] = []
-                if self._remove_padding:
-                    pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
-            else:
-                pred_tag_seq, _, _ = self._model.predict(
-                    image_batch, max_steps, beam_size
-                )
-                # Check if padding should be removed
-                if self._remove_padding:
-                    pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
-
-            prediction["tag_seq"] = pred_tag_seq
-            prediction["rs_seq"] = self._get_html_tags(pred_tag_seq)
-            prediction["html_seq"] = otsl_to_html(prediction["rs_seq"], False)
+        prediction = self._predict_image(table_image, eval_res_preds)
         # Remove implied padding from bbox predictions,
         # that we added on image pre-processing stage
         self._log().debug("----- rs_seq -----")
@@ -1027,7 +998,6 @@ class TFPredictor:
         img = img.transpose(2, 1, 0)  # (channels, width, height)
         img = torch.FloatTensor(img / 255.0)
         image_batch = img.unsqueeze(dim=0)
-        image_batch = image_batch.to(device=self._device)
         return image_batch
 
     def _get_html_tags(self, seq):

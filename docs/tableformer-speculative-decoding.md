@@ -164,12 +164,11 @@ this fork revision has not been pinned or packaged into OntoScience.
 
 ## Follow-up experiments and decisions
 
-- Moving CPU preparation and table matching outside the shared MPS guard did
-  not improve conversion time. Three full-report controls took 31.7975,
-  37.5452, and 35.3659 seconds; the narrowed guard took 38.5764, 37.1698,
-  and 37.4659 seconds. The median regressed by 5.9%. All outputs matched
-  apart from bbox rounding up to 0.0000611 PDF points. The guard change was
-  reverted. Both models still use MPS with the existing crash protection.
+- An initial three-pair lock-scope experiment observed a 5.9% median
+  regression and was temporarily reverted. Background load was not isolated;
+  this did not establish that a narrower guard was ineffective. Six later
+  alternating full-report pairs are recorded below. The narrower boundary is
+  retained to remove unnecessary serialization, without a stable speedup claim.
 - Position-aware drafts reduced decoder calls from 1058 to 887 on captured
   encoder memories. This alone did not establish a stable latency benefit.
   With one warmed model and all 37 table memories, three alternating rounds
@@ -240,3 +239,47 @@ Local evidence: `position-fork-replay-oct22.json`, `position-fork-oct22-*`,
 The scope remains external-library performance: no App Case delta or baseline
 promotion, and no installed-runtime acceptance before an immutable artifact
 is pinned and packaged by OntoScience.
+
+## Narrower submission guard: retained, no stable speedup claim
+
+Six alternating pairs used the same 77-page report, both models on MPS,
+PyTorch 2.14.1, float32, and four CPU threads. GPU benchmarks did not overlap.
+Other system activity remained; these are not isolated performance baselines.
+
+| Pair | Coarse guard | Narrow guard |
+| --- | ---: | ---: |
+| 1 | 29.88 s | 28.63 s |
+| 2 | 29.71 s | 29.05 s |
+| 3 | 29.62 s | 29.27 s |
+| 4 | 29.77 s | 30.19 s |
+| 5, complete lock timing | 32.34 s | 34.10 s |
+| 6, complete lock timing | 29.29 s | 30.28 s |
+
+The first four pairs reduced median wall time by 1.9%; the last two were
+slower. Across all six pairs the medians were effectively equal. Summed
+layout/table host lock waits in pairs 5 and 6 fell from 12.90 to 9.34 seconds
+and 11.68 to 9.47 seconds. CPU preparation and matching overlapped layout's
+held-guard intervals. These host intervals are not GPU execution timings and
+must not be added to infer critical-path savings.
+
+All twelve conversions produced 77 pages, 37 tables, 5877 cells, and zero
+conversion errors or crashes. Complete exports matched after removing only
+bbox fields; raw tag-sequence multisets matched (9180 tags including EOS).
+Maximum bbox deviation was 0.0000611 PDF points. The existing unmatched-cell
+warning remains. Reference equality is not independently verified ground truth.
+
+Retain the narrower guard to eliminate unnecessary CPU serialization. Keep all
+device transfers, inference, tensor postprocessing, and materialization under
+the shared guard. This does not remove MPS crash protection, increase worker
+counts, or establish a stable end-to-end speedup. Regression tests check both
+predictor entry points and the layout boundary. Local evidence:
+`mps-lock-retest-oct22-results.json` in OntoScience's ignored `.tmp/` directory.
+
+The integrated source revision completed a fresh full-report run in 36.457
+seconds: 77 pages, 37 tables, 5877 cells, zero errors. Content and raw tags
+matched the coarse-guard reference; maximum bbox delta was 0.0000611 PDF
+points. This is an integration observation, not a paired speedup measurement.
+The model revision passed 53 focused tests and changed-file `make validate`.
+Version `4.0.4+ontoscience.2` includes this guard interface and the earlier
+verified-decoding, position-aware-draft, and matching-index changes. No
+checkpoint weights or installed application are changed by this release.
