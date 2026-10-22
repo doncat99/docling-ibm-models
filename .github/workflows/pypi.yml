@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   build-and-publish:
+    if: ${{ !startsWith(github.event.release.tag_name, 'ontoscience-models-') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:

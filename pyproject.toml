@@ -1,6 +1,6 @@
 [project]
 name = "docling-ibm-models"
-version = "4.0.4+ontoscience.2"
+version = "4.0.4+ontoscience.3"
 description = "This package contains the AI models used by the Docling PDF conversion package"
 license = "MIT"
 keywords = ["docling", "convert", "document", "pdf", "table structure", "table former"]
