@@ -925,6 +925,9 @@ class TFPredictor:
 
         # format output to look similar to tests/examples/tf_gte_output_2.json
         tf_cell_list = []
+        cells_by_id = {}
+        for cell in table_cells:
+            cells_by_id.setdefault(cell["cell_id"], cell)
         for pdf_cell_id, pdf_cell_matches in matches.items():
             tf_cell = {
                 "bbox": {},  # b,l,r,t,token
@@ -949,11 +952,8 @@ class TFPredictor:
 
             for match in pdf_cell_matches:
                 tm = match["table_cell_id"]
-                tcl = list(
-                    filter(lambda table_cell: table_cell["cell_id"] == tm, table_cells)
-                )
-                if len(tcl) > 0:
-                    table_cell = tcl[0]
+                if tm in cells_by_id:
+                    table_cell = cells_by_id[tm]
                     row_ids.add(table_cell["row_id"])
                     column_ids.add(table_cell["column_id"])
                     labels.add(table_cell["label"])

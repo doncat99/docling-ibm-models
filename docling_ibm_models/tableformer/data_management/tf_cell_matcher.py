@@ -1,6 +1,7 @@
 import copy
 import logging
 import re
+from bisect import bisect_right
 
 import numpy as np
 
@@ -467,8 +468,8 @@ class CellMatcher:
         Compute Intersection between table cells and pdf cells,
         match 1 pdf cell with highest intersection with only 1 table cell.
 
-        First compute and cache the areas for all involved bboxes.
-        Then compute the pairwise intersections
+        Index vertical intervals to skip disjoint rows. Restore source pair order
+        before matching so duplicate IDs and tie-breaking retain their meaning.
 
         Parameters
         ----------
@@ -485,21 +486,53 @@ class CellMatcher:
         int
             Number of total matches
         """
-        pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells])
+        pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells]).reshape(-1, 4)
         pdf_bboxes_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
             pdf_bboxes[:, 3] - pdf_bboxes[:, 1]
         )
+
+        if not table_cells or not pdf_cells:
+            return {}, 0
+        intervals = sorted(
+            (min(cell["bbox"][1], cell["bbox"][3]), index)
+            for index, cell in enumerate(pdf_cells)
+        )
+        tops = [top for top, _ in intervals]
+        leaf_count = 1 << (len(intervals) - 1).bit_length()
+        max_bottom = [float("-inf")] * (2 * leaf_count)
+        for offset, (_, index) in enumerate(intervals):
+            bbox = pdf_cells[index]["bbox"]
+            max_bottom[leaf_count + offset] = max(bbox[1], bbox[3])
+        for node in range(leaf_count - 1, 0, -1):
+            max_bottom[node] = max(max_bottom[2 * node], max_bottom[2 * node + 1])
 
         # key: pdf_cell_id, value: list of TableCell that fall inside that pdf_cell
         matches = {}
         matches_counter = 0
 
         # Compute Intersections and build matches
-        for i, table_cell in enumerate(table_cells):
+        for table_cell in table_cells:
             table_cell_id = table_cell["cell_id"]
             t_bbox = table_cell["bbox"]
 
-            for j, pdf_cell in enumerate(pdf_cells):
+            # Keep only one cell's candidates, never the Cartesian pair matrix.
+            top, bottom = sorted((t_bbox[1], t_bbox[3]))
+            limit = bisect_right(tops, bottom)
+            candidates = []
+            pending = [(1, 0, leaf_count)]
+            while pending:
+                node, start, end = pending.pop()
+                if start >= limit or max_bottom[node] < top:
+                    continue
+                if end - start == 1:
+                    candidates.append(intervals[start][1])
+                    continue
+                middle = (start + end) // 2
+                pending.append((2 * node + 1, middle, end))
+                pending.append((2 * node, start, middle))
+
+            for j in sorted(candidates):
+                pdf_cell = pdf_cells[j]
                 pdf_cell_id = pdf_cell["id"]
                 p_bbox = pdf_cell["bbox"]
 

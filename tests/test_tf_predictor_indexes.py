@@ -12,6 +12,31 @@ def _cell(start_col, start_row, col_span=1, row_span=1):
     }
 
 
+def test_response_index_preserves_first_duplicate_and_missing_matches():
+    cells = [
+        {
+            "cell_id": 4,
+            "row_id": 0,
+            "column_id": 2,
+            "label": "ched",
+            "bbox": [1, 2, 3, 4],
+        },
+        {
+            "cell_id": 4,
+            "row_id": 9,
+            "column_id": 9,
+            "label": "rhed",
+            "bbox": [8, 8, 9, 9],
+        },
+    ]
+    matches = {"7": [{"table_cell_id": 4}, {"table_cell_id": 999}]}
+    result = TFPredictor.__new__(TFPredictor)._generate_tf_response(cells, matches)[0]
+    assert result["row_ids"] == [0]
+    assert result["column_ids"] == [2]
+    assert result["column_header"] and not result["row_header"]
+    assert result["bbox"] == {"l": 1, "t": 2, "r": 3, "b": 4}
+
+
 def _issue_123_cells():
     r"""
     The table reported in docling-ibm-models#123.
