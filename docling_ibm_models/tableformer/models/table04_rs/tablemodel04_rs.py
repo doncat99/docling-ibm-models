@@ -19,30 +19,46 @@ LOG_LEVEL = logging.WARN
 
 
 class _TagDraft:
-    """Index accepted tags once; rejected proposals never enter the index."""
+    """Draft from accepted suffixes at the same row offset before other offsets."""
 
-    def __init__(self, start, default_tag, max_context=16):
+    def __init__(self, start, default_tag, row_end, max_context=8):
         self.history = [start]
         self.default_tag = default_tag
+        self.row_end = row_end
+        self.row_offset = 0
         self.patterns = [{} for _ in range(max_context + 1)]
+        self.position_patterns = [{} for _ in self.patterns]
 
     def append(self, tag):
         for width in range(1, min(len(self.patterns) - 1, len(self.history)) + 1):
-            self.patterns[width][tuple(self.history[-width:])] = tag
+            suffix = tuple(self.history[-width:])
+            self.patterns[width][suffix] = tag
+            self.position_patterns[width][(self.row_offset, suffix)] = tag
         self.history.append(tag)
+        self.row_offset = 0 if tag == self.row_end else self.row_offset + 1
 
     def propose(self, count):
         working = self.history[-(len(self.patterns) - 1) :]
+        row_offset = self.row_offset
         proposed = []
         for _ in range(count):
-            tag = self.default_tag
+            tag = None
             for width in range(min(len(self.patterns) - 1, len(working)), 0, -1):
-                candidate = self.patterns[width].get(tuple(working[-width:]))
-                if candidate is not None:
-                    tag = candidate
+                tag = self.position_patterns[width].get(
+                    (row_offset, tuple(working[-width:]))
+                )
+                if tag is not None:
                     break
+            if tag is None:
+                for width in range(min(len(self.patterns) - 1, len(working)), 0, -1):
+                    tag = self.patterns[width].get(tuple(working[-width:]))
+                    if tag is not None:
+                        break
+            if tag is None:
+                tag = self.default_tag
             proposed.append(tag)
             working.append(tag)
+            row_offset = 0 if tag == self.row_end else row_offset + 1
         return proposed
 
 
@@ -160,7 +176,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             block_size = 32 if str(self._device) == "mps" else 16
         transformer = self._tag_transformer
         states = transformer._decoder.prepare_cache(encoder_out, max_steps)
-        draft = _TagDraft(word_map["<start>"], word_map["fcel"])
+        draft = _TagDraft(word_map["<start>"], word_map["fcel"], word_map["nl"])
         history = draft.history
         while len(history) - 1 < max_steps:
             position = len(history) - 1

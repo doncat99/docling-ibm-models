@@ -5,8 +5,10 @@ OntoScience release or a general speed guarantee.
 
 ## Algorithm and remaining limits
 
-The decoder proposes up to 31 tags on MPS (15 on other backends) from the longest previously accepted tag
-suffix. One causal decoder call verifies the current token and the proposals.
+The decoder proposes up to 31 tags on MPS (15 on other backends). It first
+searches accepted suffixes at the same tag offset within a row, then searches
+suffixes without a position constraint if that position has no match. One
+causal decoder call verifies the current token and the proposals.
 Only the greedy-consistent prefix is accepted. The first mismatch supplies the
 next accepted token; later speculative cache entries are overwritten on the next
 call. Existing structure corrections and EOS rules remain in force. Model
@@ -32,7 +34,9 @@ The original prototype rebuilt its suffix index from the entire history on
 every verification call, even at verification width 1. With a fixed 16-token
 context, cumulative index-building work could grow quadratically with output
 length. `_TagDraft` now indexes each accepted transition once and uses only a
-bounded suffix for proposals. Rejected proposals never enter the index. The
+bounded suffix for proposals. The position-aware implementation uses an
+eight-token context, as in the evaluated prototype. Rejected proposals never
+enter either index. The
 draft-matching test compares every incremental update with an independent
 full-history search over repeated and irregular tags.
 
@@ -158,7 +162,7 @@ product contract, Case pass criterion, or baseline changed. App-level
 `change-verification` and installed-runtime acceptance were not run because
 this fork revision has not been pinned or packaged into OntoScience.
 
-## Rejected follow-up experiments
+## Follow-up experiments and decisions
 
 - Moving CPU preparation and table matching outside the shared MPS guard did
   not improve conversion time. Three full-report controls took 31.7975,
@@ -171,7 +175,8 @@ this fork revision has not been pinned or packaged into OntoScience.
   With one warmed model and all 37 table memories, three alternating rounds
   took 9.052/11.048/12.274 seconds for the committed draft and
   9.186/10.865/9.513 seconds for the position-aware draft. All tags agreed.
-  This prototype was not selected for production.
+  This latency evidence alone did not select the prototype. It was later
+  retained for its measured reduction in verification calls; see below.
 - Confidence-based draft widths raised accepted-output/verified-position
   utilization from 32.3% to 50.5%, but increased calls from 887 to 1029.
   The same warmed-model experiment took 11.404/10.232/12.625 seconds:
@@ -185,3 +190,53 @@ conversion timings, so it was replaced with the bounded-memory index above.
 The replay scripts, captured inputs, and full conversion evidence remain in
 the local OntoScience `.tmp/` workspace. No adaptive decoding or narrower MPS
 guard is shipped by this follow-up.
+
+## Position-aware candidates
+
+Suffix-only drafting conflates identical tag suffixes at different positions
+within a row. `_TagDraft` now keeps accepted continuations keyed by both the
+suffix and its row offset, before consulting position-independent suffixes.
+The offset counts accepted OTSL tags since the latest `nl`, not visual PDF
+columns. The `nl` token ID comes from the model vocabulary. Each proposal
+advances a local offset; only accepted tags change the persistent offset and
+indexes. Rejected speculative tags cannot train the next proposal.
+
+This improves the proposal heuristic, not the model's correctness rules:
+the greedy verifier, EOS/budget limits, table corrections, and KV-cache rollback
+remain unchanged. A poor proposal was wasted work rather than evidence of a
+wrong final table. No weight or acceptance threshold changed. The additional
+position index grows linearly with accepted output for a fixed context bound;
+it does add CPU bookkeeping and memory, which can offset fewer decoder calls.
+
+With the final fork implementation, all 37 captured MPS table memories again
+produced the same 9180 accepted tags, including EOS. Verification calls fell
+from 1058 to 887 (16.2%). All corresponding accepted decoder hidden states
+were exactly equal in this replay (maximum absolute delta 0). This is observed
+equality on these memories, not a general bitwise guarantee. The earlier
+full-report 32.18-to-29.91-second median also included spatial matching and
+cannot be attributed to position-aware candidates alone.
+
+Tests compare each incremental update against an independent full-history
+position-aware search, distinguish the same suffix at different row offsets,
+exercise different vocabulary IDs for `nl`, and check that repeated proposals
+do not alter accepted state. Existing random-model tests continue to compare
+greedy tags and hidden states after rejected proposals at widths 16/32/64.
+
+The final implementation passed 51 affected tests and `make validate`.
+The same four full PDF fixtures also completed with zero conversion errors:
+
+| Input | Conversion time | Maximum bbox delta from the pre-change export |
+| --- | ---: | ---: |
+| Vermilion, 77 pages / 37 tables / 5877 cells | 32.976 s | 0 |
+| normal_4pages, 4 pages / 1 table / 15 cells | 4.323 s | 0.0000229 PDF points |
+| 2206.01062, 9 pages / 5 tables / 420 cells | 5.185 s | 0 |
+| redp5110_sampled, 18 pages / 6 tables / 198 cells | 6.443 s | 0.0001221 PDF points |
+
+All exported content except bbox and all raw tag-sequence multisets agreed
+with the interval-index-only reference exports. Those reference conversions
+ran earlier, so these times must not be used as a fresh paired speed test.
+Local evidence: `position-fork-replay-oct22.json`, `position-fork-oct22-*`,
+`position-fork-validation-oct22.py`, and `compare-position-fork-oct22.py`.
+The scope remains external-library performance: no App Case delta or baseline
+promotion, and no installed-runtime acceptance before an immutable artifact
+is pinned and packaged by OntoScience.

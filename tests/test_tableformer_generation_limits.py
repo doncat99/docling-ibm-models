@@ -136,41 +136,65 @@ def test_verified_block_matches_each_serial_greedy_step():
 
 
 def test_tableformer_drafts_the_longest_repeated_tag_suffix():
-    draft = _TagDraft(1, 5)
+    draft = _TagDraft(1, 5, row_end=9)
     for tag in [2, 3, 4, 2, 3, 4]:
         draft.append(tag)
     assert draft.propose(3) == [2, 3, 4]
 
 
-def full_history_draft(history, count):
-    """Original full-history matcher, kept only as an independent test oracle."""
+def full_history_draft(history, count, row_end):
+    """Search accepted history directly, independently of incremental indexes."""
+    positions = [0]
+    for tag in history[1:]:
+        positions.append(0 if tag == row_end else positions[-1] + 1)
+    position = positions[-1]
     proposed = []
     working = history.copy()
     for _ in range(count):
         found = None
-        for width in range(min(16, len(working)), 0, -1):
-            suffix = working[-width:]
-            for index in range(len(history) - width - 1, -1, -1):
-                if history[index : index + width] == suffix:
-                    found = history[index + width]
+        for same_position in (True, False):
+            for width in range(min(8, len(working)), 0, -1):
+                suffix = working[-width:]
+                for index in range(len(history) - width - 1, -1, -1):
+                    if same_position and positions[index + width - 1] != position:
+                        continue
+                    if history[index : index + width] == suffix:
+                        found = history[index + width]
+                        break
+                if found is not None:
                     break
             if found is not None:
                 break
         proposed.append(5 if found is None else found)
         working.append(proposed[-1])
+        position = 0 if proposed[-1] == row_end else position + 1
     return proposed
 
 
 def test_incremental_draft_index_matches_full_history_after_every_accept():
     history = [2]
-    draft = _TagDraft(2, 5)
+    draft = _TagDraft(2, 5, row_end=9)
     generator = torch.Generator().manual_seed(19)
     # Repeated rows plus irregular spans exercise longest-suffix replacement.
     stream = [5, 5, 9] * 20 + torch.randint(4, 13, (80,), generator=generator).tolist()
     for tag in stream:
         history.append(tag)
         draft.append(tag)
-        assert draft.propose(15) == full_history_draft(history, 15)
+        assert draft.propose(15) == full_history_draft(history, 15, row_end=9)
+
+
+@pytest.mark.parametrize("row_end", [9, 77])
+def test_draft_distinguishes_same_suffix_at_different_row_positions(row_end):
+    draft = _TagDraft(2, 5, row_end=row_end, max_context=1)
+    for tag in [5, 6, row_end, 5, 5, 7, row_end, 5]:
+        draft.append(tag)
+    before = draft.history.copy()
+    # At row offset 1, the latest accepted continuation of [5] is 5, not 7.
+    assert draft.propose(4) == [5, 7, row_end, 5]
+    assert draft.propose(4) == [5, 7, row_end, 5]
+    assert draft.history == before
+    draft.append(6)
+    assert draft.history == [*before, 6]
 
 
 @torch.no_grad()
