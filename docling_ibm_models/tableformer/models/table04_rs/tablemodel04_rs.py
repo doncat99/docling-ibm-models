@@ -154,8 +154,10 @@ class TableModel04_rs(BaseModel, nn.Module):
         return tag
 
     def _verified_tag_steps(
-        self, encoder_out, max_steps, word_map, line_num=0, block_size=16
+        self, encoder_out, max_steps, word_map, line_num=0, block_size=None
     ) -> Iterator[tuple[torch.Tensor, int]]:
+        if block_size is None:
+            block_size = 32 if str(self._device) == "mps" else 16
         transformer = self._tag_transformer
         states = transformer._decoder.prepare_cache(encoder_out, max_steps)
         draft = _TagDraft(word_map["<start>"], word_map["fcel"])

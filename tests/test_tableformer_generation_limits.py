@@ -175,14 +175,17 @@ def test_incremental_draft_index_matches_full_history_after_every_accept():
 
 @torch.no_grad()
 @pytest.mark.parametrize("seed", [7, 19, 31])
-def test_rejected_proposals_preserve_greedy_tags_and_hidden_states(seed):
+@pytest.mark.parametrize("block_size", [16, 32, 64])
+def test_rejected_proposals_preserve_greedy_tags_and_hidden_states(seed, block_size):
     torch.manual_seed(seed)
     model = model_with_eos(None)
     model._tag_transformer._fc = nn.Linear(512, 13)
     memory = torch.randn(4, 1, 512)
     vocab = model._init_data["word_map"]["word_map_tag"]
     serial = list(model._verified_tag_steps(memory, 48, vocab, block_size=1))
-    speculative = list(model._verified_tag_steps(memory, 48, vocab, block_size=16))
+    speculative = list(
+        model._verified_tag_steps(memory, 48, vocab, block_size=block_size)
+    )
     assert [tag for _, tag in speculative] == [tag for _, tag in serial]
     torch.testing.assert_close(
         torch.cat([state for state, _ in speculative]),

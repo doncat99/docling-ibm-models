@@ -5,13 +5,28 @@ OntoScience release or a general speed guarantee.
 
 ## Algorithm and remaining limits
 
-The decoder proposes up to 15 tags from the longest previously accepted tag
+The decoder proposes up to 31 tags on MPS (15 on other backends) from the longest previously accepted tag
 suffix. One causal decoder call verifies the current token and the proposals.
 Only the greedy-consistent prefix is accepted. The first mismatch supplies the
 next accepted token; later speculative cache entries are overwritten on the next
 call. Existing structure corrections and EOS rules remain in force. Model
 weights, attention context, numerical precision, and table accuracy mode do not
 change. This groups work within one table; it does not batch different tables.
+
+The MPS width increased from 16 to 32 after captured-memory comparisons at
+widths 8, 16, 32, and 64. All 37 sequences matched; width 32 reduced decoder
+calls from 1299 to 1058. Width 64 made fewer calls but was slower in the
+follow-up sweep, so it was not selected. CPU/CUDA retain width 16 because this
+measurement does not establish a benefit there. Verification and EOS semantics
+are unchanged. The rejected-proposal test exercises widths 16, 32, and 64.
+
+Combined with eval-only ResNet convolution/normalization folding in the Docling
+fork, three alternating full-report pairs reduced the 77-page median from
+39.129 to 33.056 seconds (15.5%). All exported content except bbox matched;
+maximum bbox difference was 0.000145 PDF points. Three additional PDF fixtures
+(9, 18, and 4 pages) preserved content and tags too. This combined result cannot
+be attributed to the width change alone. See the Docling fork's
+`docs/usage/mps_performance.md` for all runs and memory/validation limits.
 
 The original prototype rebuilt its suffix index from the entire history on
 every verification call, even at verification width 1. With a fixed 16-token
